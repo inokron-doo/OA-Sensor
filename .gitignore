@@ -1,0 +1,25 @@
+# Build directories
+Debug/
+Release/
+build/
+
+# Build artifacts
+*.o
+*.d
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.lnp
+*.sct
+*.dep
+*.build_log.htm
+
+# IDE specific
+.settings/
+*.uvguix.*
+
+# Backup files
+*~
+*.bak
