@@ -1,0 +1,28 @@
+--cpu Cortex-M0
+"lora_sensor_network\startup_stm32f051x8.o"
+"lora_sensor_network\main.o"
+"lora_sensor_network\stm32f0xx_it.o"
+"lora_sensor_network\stm32f0xx_hal_msp.o"
+"lora_sensor_network\stm32f0xx_hal_crc.o"
+"lora_sensor_network\stm32f0xx_hal_crc_ex.o"
+"lora_sensor_network\stm32f0xx_hal_rcc.o"
+"lora_sensor_network\stm32f0xx_hal_rcc_ex.o"
+"lora_sensor_network\stm32f0xx_hal.o"
+"lora_sensor_network\stm32f0xx_hal_i2c.o"
+"lora_sensor_network\stm32f0xx_hal_i2c_ex.o"
+"lora_sensor_network\stm32f0xx_hal_gpio.o"
+"lora_sensor_network\stm32f0xx_hal_dma.o"
+"lora_sensor_network\stm32f0xx_hal_cortex.o"
+"lora_sensor_network\stm32f0xx_hal_pwr.o"
+"lora_sensor_network\stm32f0xx_hal_pwr_ex.o"
+"lora_sensor_network\stm32f0xx_hal_flash.o"
+"lora_sensor_network\stm32f0xx_hal_flash_ex.o"
+"lora_sensor_network\stm32f0xx_hal_exti.o"
+"lora_sensor_network\stm32f0xx_hal_iwdg.o"
+"lora_sensor_network\stm32f0xx_hal_uart.o"
+"lora_sensor_network\stm32f0xx_hal_uart_ex.o"
+"lora_sensor_network\system_stm32f0xx.o"
+--strict --scatter "LoRA_sensor_network\LoRA_sensor_network.sct"
+--summary_stderr --info summarysizes --map --load_addr_map_info --xref --callgraph --symbols
+--info sizes --info totals --info unused --info veneers
+--list "LoRA_sensor_network.map" -o LoRA_sensor_network\LoRA_sensor_network.axf
