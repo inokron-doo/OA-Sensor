@@ -39,9 +39,11 @@
 #define SENSOR_DEVICE_ID	1	//UNIQUE sensor ID, change this to unique for sensor nodes
 
 // ── Distance sensor pipeline tunables ────────────────────────────────────────
-#define DIST_BUF_SIZE           7   // Stage A: per-sensor rolling buffer (odd → clean median)
-#define PROBE_TIMEOUT_MS      600   // Startup probe: wait this long per port for a valid frame
-#define BLOCKAGE_THRESHOLD_MM 300   // Stage B: reject a sensor whose median is this far below the max
+// The sensor outputs ~10 frames/s at 115200 baud.
+// With a 10 s TX interval the active sensor collects up to ~100 samples.
+// We allocate 100 slots; 95th-percentile index = (count * 95) / 100 - 1.
+#define DIST_BUF_SIZE           100  // Per-sensor sample buffer (up to ~10 s @ 10 Hz)
+#define PROBE_TIMEOUT_MS        600  // Startup probe: wait this long per port for a valid frame
 #define SEND_TO_LORA_NET_EVERY_10_SEC 100  //100ms unit (10 s)
 /* USER CODE END PD */
 
@@ -119,9 +121,13 @@ static          uint8_t      tof_frame_buf[SEN0524_FRAME_LEN];
 static volatile uint8_t      tof_frame_idx = 0;   // bytes collected so far
 
 uint16_t distance_mm        = 0;   // Latest decoded distance (mm)
-uint16_t avg_distance_mm    = 0;   // Average of values in circular buffer
 volatile uint8_t distance_sensor_packet_ready = 0;  // Flag: new packet available
 static uint32_t last_valid_packet_tick = 0;   // for the watchdog
+
+// Current distance sensor slot (index into active_sensor_idx[]) that the MUX
+// is pointing at.  Written authoritatively by sensors_data_sending_to_LoRA_concentrator()
+// whenever it switches the MUX; read by the main loop to target DistanceBuffer_Add().
+static uint8_t cur_dist_slot = 0;
 
 // helper functions for debugging
 void vprint(const char *fmt, va_list argp)
@@ -213,8 +219,7 @@ int decode_distance_A01NYUB(uint8_t *buf, uint16_t *distance_mm)
 
 typedef struct {
     uint16_t buf[DIST_BUF_SIZE];
-    uint8_t head;
-    uint8_t count;
+    uint8_t  count;   // number of valid samples stored (0 .. DIST_BUF_SIZE)
 } DistanceBuffer_t;
 
 DistanceBuffer_t distBuf[4];  //buffer for 1,2,3,4 distance sensors
@@ -225,37 +230,35 @@ uint8_t num_sensors_present = 0;              // how many ports are active
 uint8_t active_sensor_idx[4];                 // indices (0-based) of active ports
 
 /**
- * Add a new distance value (mm) into the circular buffer.
+ * Add a new distance value (mm) into the flat buffer (fills up to DIST_BUF_SIZE).
+ * Oldest samples are simply dropped once the buffer is full — caller should
+ * clear the buffer after reading the result.
  */
 void DistanceBuffer_Add(uint8_t i, uint16_t value)
 {
-    distBuf[i].buf[distBuf[i].head] = value;
-
-    distBuf[i].head++;
-    if (distBuf[i].head >= DIST_BUF_SIZE)
-        distBuf[i].head = 0;
-
     if (distBuf[i].count < DIST_BUF_SIZE)
-        distBuf[i].count++;
+        distBuf[i].buf[distBuf[i].count++] = value;
+    // else: buffer full — discard; caller must clear between TX events
 }
 
 /**
- * Stage A filter: median of the rolling buffer for sensor i.
- * Uses an insertion sort on a local copy — no dynamic allocation.
- * Returns 0 if buffer is empty.
+ * 95th-percentile filter: sort a local copy of the buffer and return the
+ * value at the 95 % rank.  Returns 0 if buffer is empty.
+ *
+ * With N samples the 95th-percentile index = (N * 95) / 100
+ * (integer division; for N=100 → index 95, for N=10 → index 9).
  */
-uint16_t DistanceBuffer_GetMedian(uint8_t i)
+uint16_t DistanceBuffer_Get95thPercentile(uint8_t i)
 {
-    if (distBuf[i].count == 0)
+    uint8_t n = distBuf[i].count;
+    if (n == 0)
         return 0;
 
     uint16_t tmp[DIST_BUF_SIZE];
-    uint8_t  n = distBuf[i].count;
-
     for (uint8_t j = 0; j < n; j++)
         tmp[j] = distBuf[i].buf[j];
 
-    // Insertion sort
+    // Insertion sort (fast enough for ≤100 elements on a Cortex-M0)
     for (uint8_t j = 1; j < n; j++) {
         uint16_t key = tmp[j];
         int8_t   k   = (int8_t)j - 1;
@@ -266,16 +269,13 @@ uint16_t DistanceBuffer_GetMedian(uint8_t i)
         tmp[k + 1] = key;
     }
 
-    return tmp[n / 2];   // middle element
+    uint8_t idx_95 = (uint8_t)(((uint16_t)n * 95u) / 100u);
+    if (idx_95 >= n) idx_95 = n - 1;  // clamp (handles n=1)
+    return tmp[idx_95];
 }
 
 void DistanceBuffer_Clear(uint8_t idx)
 {
-    for (uint8_t j = 0; j < DIST_BUF_SIZE; j++) {
-        distBuf[idx].buf[j] = 0;
-    }
-
-    distBuf[idx].head  = 0;
     distBuf[idx].count = 0;
 }
 
@@ -285,59 +285,6 @@ void DistanceBuffer_Clear(uint8_t idx)
 uint8_t DistanceBuffer_GetCount(uint8_t i)
 {
     return distBuf[i].count;
-}
-
-/**
- * Stage B filter: cross-sensor blockage rejection.
- *
- * Collects the Stage-A median from every present sensor, finds the maximum
- * (most likely unobstructed reading), then rejects any sensor whose median
- * is more than BLOCKAGE_THRESHOLD_MM below that maximum.
- * The accepted readings are averaged and returned as avg_distance_mm.
- *
- * If ALL sensors are rejected (all within threshold of each other but all
- * low — e.g. every port blocked simultaneously) the function falls back to
- * the maximum value and sets *all_blocked = 1 as a warning.
- */
-uint16_t compute_filtered_distance(uint8_t *all_blocked_out)
-{
-    if (num_sensors_present == 0) {
-        if (all_blocked_out) *all_blocked_out = 1;
-        return 0;
-    }
-
-    uint16_t medians[4];
-    uint16_t max_val = 0;
-
-    // Collect per-sensor Stage-A medians and find the maximum
-    for (uint8_t s = 0; s < num_sensors_present; s++) {
-        uint8_t idx = active_sensor_idx[s];
-        medians[s]  = DistanceBuffer_GetMedian(idx);
-        if (medians[s] > max_val)
-            max_val = medians[s];
-    }
-
-    // Accept sensors within BLOCKAGE_THRESHOLD_MM of the maximum
-    uint32_t sum      = 0;
-    uint8_t  accepted = 0;
-    for (uint8_t s = 0; s < num_sensors_present; s++) {
-        if ((max_val - medians[s]) <= BLOCKAGE_THRESHOLD_MM) {
-            sum += medians[s];
-            accepted++;
-        } else {
-            my_printf("Sensor port %d blocked (median=%u, max=%u) — excluded\n\r",
-                      active_sensor_idx[s] + 1, medians[s], max_val);
-        }
-    }
-
-    if (accepted == 0) {
-        // All sensors deviate identically (all blocked at same level) — best-effort: use max
-        if (all_blocked_out) *all_blocked_out = 1;
-        return max_val;
-    }
-
-    if (all_blocked_out) *all_blocked_out = 0;
-    return (uint16_t)(sum / accepted);
 }
 
 /**
@@ -488,47 +435,74 @@ void blink_comm_LED(uint8_t times)
 
 void sensors_data_sending_to_LoRA_concentrator()
 {
-	static uint8_t sensor_type_to_send=0;
-	uint16_t value=0;
-	switch (sensor_type_to_send) {
-		case 0:	// distance sensor
-			my_printf("Sensor TX to LoRA avg distance:%d [mm]\n\r",avg_distance_mm);
-			value=avg_distance_mm;
+	// ── TX rotation ──────────────────────────────────────────────────────────
+	// Slot layout:
+	//   0          → temperature
+	//   1          → humidity
+	//   2 .. 2+N-1 → distance sensors (active_sensor_idx[0..N-1])
+	//
+	// After transmitting a distance slot the MUX is moved to the NEXT distance
+	// sensor so it has the full inter-TX interval (~10 s) to accumulate samples.
+	// The buffer of the sensor just sent is cleared so fresh samples are taken.
 
-        // Blink error LED 1–3 times based on distance range:
-      //   1 blink  = close   (< 500 mm)
-      //   2 blinks = medium  (500 – 1499 mm)
-      //   3 blinks = far     (>= 1500 mm)
-      if (avg_distance_mm <= 0)
-          blink_comm_LED(1);
-      else if (avg_distance_mm < 1000)
-          blink_comm_LED(2);
-      else
-          blink_comm_LED(3);
-			break;
-		case 1:	// temperature
-			//my_printf("Temperature: %d °C, Humidity: %d %%\r\n", int_temperature, int_humidity);
-			if((int_temperature&0x80)>0)
-				my_printf("Sensor TX to LoRA temperature:-%d [C]\n\r",int_temperature&0x7F);
-			else
-				my_printf("Sensor TX to LoRA temperature:%d [C]\n\r",int_temperature&0x7F);
-			value=int_temperature&0xFF;
-			break;
-		case 2: // humidity
-			my_printf("Sensor TX to LoRA humidity:%d [%%]\n\r",int_humidity);
-			value=int_humidity;
-			break;
+	static uint8_t tx_slot = 0;   // current position in the rotation
 
-		default:
-			value=0;
-			break;
+	uint8_t  num_slots   = 2 + num_sensors_present;   // temp + hum + N distance
+	uint16_t value       = 0;
+	uint8_t  type        = 0;
+
+	if (tx_slot == 0) {
+		// ── Temperature ──
+		type = 1;
+		if ((int_temperature & 0x80) > 0)
+			my_printf("Sensor TX to LoRA temperature:-%d [C]\n\r", int_temperature & 0x7F);
+		else
+			my_printf("Sensor TX to LoRA temperature:%d [C]\n\r", int_temperature & 0x7F);
+		value = (uint16_t)(int_temperature & 0xFF);
+
+	} else if (tx_slot == 1) {
+		// ── Humidity ──
+		type = 2;
+		my_printf("Sensor TX to LoRA humidity:%d [%%]\n\r", int_humidity);
+		value = (uint16_t)(uint8_t)int_humidity;
+
+	} else {
+		// ── Distance sensor (slot 2 .. 2+N-1) ──
+		uint8_t dist_slot = tx_slot - 2;              // 0-based index into active sensors
+		uint8_t idx       = active_sensor_idx[dist_slot];  // 0-based port index
+
+		type  = 0;
+		uint16_t p95 = DistanceBuffer_Get95thPercentile(idx);
+		my_printf("Sensor TX to LoRA port %d dist 95pct:%u mm (n=%u samples)\n\r",
+		          idx + 1, p95, DistanceBuffer_GetCount(idx));
+		value = p95;
+
+		// Blink COMM LED to indicate distance range
+		if (value <= 0)
+			blink_comm_LED(1);
+		else if (value < 1000)
+			blink_comm_LED(2);
+		else
+			blink_comm_LED(3);
+
+		// Clear this sensor's buffer — fresh accumulation starts now
+		DistanceBuffer_Clear(idx);
+
+		// Switch MUX to the NEXT distance sensor immediately so it gets
+		// the maximum collection time before its slot comes up
+		uint8_t next_dist_slot = (dist_slot + 1) % num_sensors_present;
+		uint8_t next_idx       = active_sensor_idx[next_dist_slot];
+		select_distance_sensor(next_idx + 1);
+		cur_dist_slot = next_dist_slot;  // keep main loop in sync
 	}
-	uint32_t data = encode_message(SENSOR_DEVICE_ID, sensor_type_to_send, value);
-	send_data_to_LoRA_network(data);
-	sensor_type_to_send++;
-	if (sensor_type_to_send>2)
-		sensor_type_to_send=0;  //reset
 
+	uint32_t data = encode_message(SENSOR_DEVICE_ID, type, value);
+	send_data_to_LoRA_network(data);
+
+	// Advance rotation
+	tx_slot++;
+	if (tx_slot >= num_slots)
+		tx_slot = 0;
 }
 
 
@@ -648,6 +622,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     // Re-arm for next byte
     HAL_UART_Receive_IT(&huart2, (uint8_t *)&tof_rx_byte, 1);
 }
+
 uint32_t global_100ms_counter=0;
 //timer period elapsed callback function
 //Period elapsed callback in non blocking mode
@@ -819,11 +794,8 @@ int main(void)
 
   /* USER CODE BEGIN 1 */
 	uint32_t tick_counter;
-	uint32_t time_of_mux_switch;          // controls MUX cycling (500 ms per port)
-	uint8_t  mux_slot          = 0;       // index into active_sensor_idx[]
 	uint8_t  err_cnt           = 0;
 	uint16_t print_out_cnt     = 0;
-	uint8_t  all_blocked       = 0;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -869,11 +841,11 @@ int main(void)
   // --- Auto-detect which sensor ports have live sensors ---
   probe_sensors();
 
-  // Start MUX on first active port
-  select_distance_sensor(active_sensor_idx[0] + 1);
-  mux_slot              = 0;
-  tick_counter          = HAL_GetTick();
-  time_of_mux_switch    = HAL_GetTick();
+  // Point MUX at the first active distance sensor; it will accumulate samples
+  // until the first TX event fires.
+  if (num_sensors_present > 0)
+      select_distance_sensor(active_sensor_idx[cur_dist_slot] + 1);
+  tick_counter = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -890,39 +862,23 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-	  // ── MUX cycling: spend 500 ms on each active sensor port ─────────────
-	  if ((HAL_GetTick() - time_of_mux_switch) > 500)
-	  {
-		  time_of_mux_switch = HAL_GetTick();
-
-		  // Compute Stage B filtered distance before switching away
-		  avg_distance_mm = compute_filtered_distance(&all_blocked);
-		  if (all_blocked)
-			  my_printf("WARNING: all sensors appear blocked — best-effort value: %u mm\n\r", avg_distance_mm);
-
-		  // Advance to the next active sensor
-		  mux_slot++;
-		  if (mux_slot >= num_sensors_present)
-			  mux_slot = 0;
-
-		  uint8_t next_idx = active_sensor_idx[mux_slot];
-		  select_distance_sensor(next_idx + 1);
-		  DistanceBuffer_Clear(next_idx);
-	  }
-
-	  // ── Process incoming TOF frame ────────────────────────────────────────
+	  // ── Accumulate TOF frames into the current distance sensor's buffer ───
 	  if (distance_sensor_packet_ready)
 	  {
 		  set_error_LED(0);
 		  distance_sensor_packet_ready = 0;
 
-		  uint8_t cur_idx = active_sensor_idx[mux_slot];
+		  // cur_dist_slot tracks which active sensor port the MUX is on.
+		  // sensors_data_sending_to_LoRA_concentrator() advances it (and the
+		  // MUX) each time a distance slot is transmitted, so here we just
+		  // need to know which sensor is currently collecting.
+		  uint8_t cur_idx = active_sensor_idx[cur_dist_slot];
 		  DistanceBuffer_Add(cur_idx, distance_mm);
 
 		  if ((print_out_cnt++) > 10)
 		  {
-			  my_printf("distance:%u [mm] on port %d (buf median:%u)\n\r",
-			            distance_mm, cur_idx + 1, DistanceBuffer_GetMedian(cur_idx));
+			  my_printf("distance:%u [mm] port %d (n=%u)\n\r",
+			            distance_mm, cur_idx + 1, DistanceBuffer_GetCount(cur_idx));
 			  print_out_cnt = 0;
 		  }
 		  err_cnt = 0;
@@ -954,9 +910,12 @@ int main(void)
 	  // ── LoRa TX every 10 s ────────────────────────────────────────────────
 	  if (global_100ms_counter % SEND_TO_LORA_NET_EVERY_10_SEC == 0)
 	  {
+		  // Read T/H regardless — it's needed whenever a temp/hum slot fires
 		  SHT85_Read();
 		  my_printf("TX to LoRA concentrator at: %d [s]\n\r", global_100ms_counter / 10);
 		  sensors_data_sending_to_LoRA_concentrator();
+		  // cur_dist_slot is updated inside sensors_data_sending_to_LoRA_concentrator()
+		  // whenever it switches the MUX — no sync needed here.
 	  }
   }
   /* USER CODE END 3 */
