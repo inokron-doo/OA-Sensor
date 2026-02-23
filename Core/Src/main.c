@@ -37,12 +37,12 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define SENSOR_DEVICE_ID	1	//UNIQUE sensor ID, change this to unique for sensor nodes
-#define NUMBER_OF_DISTANCE_SENSORS_INSERTED_IN_PCB 1  //change this number according to used number of ultrasonic sensors [1,2,3,4]
 
-#define DIST_BUF_SIZE   10		// number of samples for average calculation
-#define SEND_TO_LORA_NET_EVERY_10_SEC 100  //100ms unit
-
-#define ONE_ULTRASONIC_SENSOR 1
+// ── Distance sensor pipeline tunables ────────────────────────────────────────
+#define DIST_BUF_SIZE           7   // Stage A: per-sensor rolling buffer (odd → clean median)
+#define PROBE_TIMEOUT_MS      600   // Startup probe: wait this long per port for a valid frame
+#define BLOCKAGE_THRESHOLD_MM 300   // Stage B: reject a sensor whose median is this far below the max
+#define SEND_TO_LORA_NET_EVERY_10_SEC 100  //100ms unit (10 s)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -89,10 +89,39 @@ void set_error_LED(uint8_t val);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-uint8_t rx_buffer[10];               	// RX buffer for 4-byte packet
-uint16_t distance_mm=0;               	// Latest decoded distance
-uint16_t avg_distance_mm=0;				// Average of values stored in the buffer
-volatile uint8_t distance_sensor_packet_ready = 0;  // Flag when a new packet is available
+// ── DFRobot SEN0524 TOF sensor (921600 baud, 16-byte active-output frames) ──
+// Frame layout:
+//  [0]      Frame Header    0x57
+//  [1]      Function Mark   0x00
+//  [2]      reserved
+//  [3]      id              module ID
+//  [4..7]   system_time     uint32 LE (ms)
+//  [8..10]  dis*1000        int24  LE (metres × 1000  →  mm when ×1)
+//  [11]     dis_status      0=valid, 1=invalid
+//  [12..13] signal_strength uint16 LE
+//  [14]     range_precision uint8 (cm)
+//  [15]     sum_check       lowest byte of sum of bytes [0..14]
+
+#define SEN0524_FRAME_HEADER    0x57
+#define SEN0524_FUNCTION_MARK   0x00
+#define SEN0524_FRAME_LEN       16
+
+// State machine states for frame reception
+typedef enum {
+    TOF_STATE_WAIT_HEADER = 0,   // waiting for 0x57
+    TOF_STATE_WAIT_FUNC,         // waiting for 0x00
+    TOF_STATE_COLLECT,           // collecting remaining 14 bytes
+} TofRxState_t;
+
+static volatile TofRxState_t tof_rx_state  = TOF_STATE_WAIT_HEADER;
+static volatile uint8_t      tof_rx_byte   = 0;   // single-byte DMA/IT target
+static          uint8_t      tof_frame_buf[SEN0524_FRAME_LEN];
+static volatile uint8_t      tof_frame_idx = 0;   // bytes collected so far
+
+uint16_t distance_mm        = 0;   // Latest decoded distance (mm)
+uint16_t avg_distance_mm    = 0;   // Average of values in circular buffer
+volatile uint8_t distance_sensor_packet_ready = 0;  // Flag: new packet available
+static uint32_t last_valid_packet_tick = 0;   // for the watchdog
 
 // helper functions for debugging
 void vprint(const char *fmt, va_list argp)
@@ -189,10 +218,16 @@ typedef struct {
 } DistanceBuffer_t;
 
 DistanceBuffer_t distBuf[4];  //buffer for 1,2,3,4 distance sensors
+
+// ── Sensor auto-detection (set at startup by probe_sensors()) ────────────────
+uint8_t sensor_present[4]   = {0, 0, 0, 0};  // 1 if port [0..3] responded
+uint8_t num_sensors_present = 0;              // how many ports are active
+uint8_t active_sensor_idx[4];                 // indices (0-based) of active ports
+
 /**
  * Add a new distance value (mm) into the circular buffer.
  */
-void DistanceBuffer_Add(uint8_t i,uint16_t value)
+void DistanceBuffer_Add(uint8_t i, uint16_t value)
 {
     distBuf[i].buf[distBuf[i].head] = value;
 
@@ -205,37 +240,151 @@ void DistanceBuffer_Add(uint8_t i,uint16_t value)
 }
 
 /**
- * Calculate the average of values stored in the buffer.
+ * Stage A filter: median of the rolling buffer for sensor i.
+ * Uses an insertion sort on a local copy — no dynamic allocation.
  * Returns 0 if buffer is empty.
  */
-uint16_t DistanceBuffer_GetAverage(uint8_t i)
+uint16_t DistanceBuffer_GetMedian(uint8_t i)
 {
     if (distBuf[i].count == 0)
         return 0;
 
-    uint32_t sum = 0;
+    uint16_t tmp[DIST_BUF_SIZE];
+    uint8_t  n = distBuf[i].count;
 
-    for (uint8_t j = 0; j < distBuf[i].count; j++) {
-        sum += distBuf[i].buf[j];
+    for (uint8_t j = 0; j < n; j++)
+        tmp[j] = distBuf[i].buf[j];
+
+    // Insertion sort
+    for (uint8_t j = 1; j < n; j++) {
+        uint16_t key = tmp[j];
+        int8_t   k   = (int8_t)j - 1;
+        while (k >= 0 && tmp[k] > key) {
+            tmp[k + 1] = tmp[k];
+            k--;
+        }
+        tmp[k + 1] = key;
     }
 
-    return (uint16_t)(sum / distBuf[i].count);
+    return tmp[n / 2];   // middle element
 }
+
 void DistanceBuffer_Clear(uint8_t idx)
 {
     for (uint8_t j = 0; j < DIST_BUF_SIZE; j++) {
         distBuf[idx].buf[j] = 0;
     }
 
-    distBuf[idx].head = 0;
+    distBuf[idx].head  = 0;
     distBuf[idx].count = 0;
 }
+
 /**
  * Get the number of valid items currently stored in the buffer.
  */
 uint8_t DistanceBuffer_GetCount(uint8_t i)
 {
     return distBuf[i].count;
+}
+
+/**
+ * Stage B filter: cross-sensor blockage rejection.
+ *
+ * Collects the Stage-A median from every present sensor, finds the maximum
+ * (most likely unobstructed reading), then rejects any sensor whose median
+ * is more than BLOCKAGE_THRESHOLD_MM below that maximum.
+ * The accepted readings are averaged and returned as avg_distance_mm.
+ *
+ * If ALL sensors are rejected (all within threshold of each other but all
+ * low — e.g. every port blocked simultaneously) the function falls back to
+ * the maximum value and sets *all_blocked = 1 as a warning.
+ */
+uint16_t compute_filtered_distance(uint8_t *all_blocked_out)
+{
+    if (num_sensors_present == 0) {
+        if (all_blocked_out) *all_blocked_out = 1;
+        return 0;
+    }
+
+    uint16_t medians[4];
+    uint16_t max_val = 0;
+
+    // Collect per-sensor Stage-A medians and find the maximum
+    for (uint8_t s = 0; s < num_sensors_present; s++) {
+        uint8_t idx = active_sensor_idx[s];
+        medians[s]  = DistanceBuffer_GetMedian(idx);
+        if (medians[s] > max_val)
+            max_val = medians[s];
+    }
+
+    // Accept sensors within BLOCKAGE_THRESHOLD_MM of the maximum
+    uint32_t sum      = 0;
+    uint8_t  accepted = 0;
+    for (uint8_t s = 0; s < num_sensors_present; s++) {
+        if ((max_val - medians[s]) <= BLOCKAGE_THRESHOLD_MM) {
+            sum += medians[s];
+            accepted++;
+        } else {
+            my_printf("Sensor port %d blocked (median=%u, max=%u) — excluded\n\r",
+                      active_sensor_idx[s] + 1, medians[s], max_val);
+        }
+    }
+
+    if (accepted == 0) {
+        // All sensors deviate identically (all blocked at same level) — best-effort: use max
+        if (all_blocked_out) *all_blocked_out = 1;
+        return max_val;
+    }
+
+    if (all_blocked_out) *all_blocked_out = 0;
+    return (uint16_t)(sum / accepted);
+}
+
+/**
+ * Startup sensor probe: select each MUX port in turn, wait up to
+ * PROBE_TIMEOUT_MS for a valid SEN0524 frame to arrive, then record
+ * which ports have live sensors.  Populates sensor_present[],
+ * active_sensor_idx[], and num_sensors_present.
+ */
+void probe_sensors(void)
+{
+    num_sensors_present = 0;
+    my_printf("Probing sensor ports...\n\r");
+
+    for (uint8_t port = 1; port <= 4; port++) {
+        select_distance_sensor(port);
+        distance_sensor_packet_ready = 0;
+
+        uint32_t t_start = HAL_GetTick();
+        while ((HAL_GetTick() - t_start) < PROBE_TIMEOUT_MS) {
+            HAL_IWDG_Refresh(&hiwdg);
+            if (distance_sensor_packet_ready && distance_mm > 0) {
+                break;
+            }
+        }
+
+        if (distance_sensor_packet_ready && distance_mm > 0) {
+            sensor_present[port - 1] = 1;
+            active_sensor_idx[num_sensors_present] = port - 1;
+            num_sensors_present++;
+            my_printf("  Port %d: FOUND (d=%u mm)\n\r", port, distance_mm);
+        } else {
+            sensor_present[port - 1] = 0;
+            my_printf("  Port %d: not detected\n\r", port);
+        }
+
+        distance_sensor_packet_ready = 0;
+    }
+
+    my_printf("Probe complete: %d sensor(s) found.\n\r", num_sensors_present);
+
+    // If nothing found, fall back to port 1 so the system still runs
+    if (num_sensors_present == 0) {
+        my_printf("WARNING: no sensors detected — defaulting to port 1\n\r");
+        sensor_present[0]      = 1;
+        active_sensor_idx[0]   = 0;
+        num_sensors_present    = 1;
+    }
 }
 
 // select one distance sensor using multiplexer chip
@@ -326,7 +475,16 @@ void SHT85_Read(void)
 #define DISABLE_USART1 USART1->CR1&=~USART_CR1_UE;
 #define ENABLE_USART1  USART1->CR1|=USART_CR1_UE;
 
-
+void blink_comm_LED(uint8_t times)
+{
+    for (uint8_t i = 0; i < times; i++)
+    {
+        HAL_GPIO_WritePin(G_COMM_GPIO_Port, G_COMM_Pin, GPIO_PIN_SET);
+        HAL_Delay(150);
+        HAL_GPIO_WritePin(G_COMM_GPIO_Port, G_COMM_Pin, GPIO_PIN_RESET);
+        HAL_Delay(150);
+    }
+}
 
 void sensors_data_sending_to_LoRA_concentrator()
 {
@@ -336,6 +494,17 @@ void sensors_data_sending_to_LoRA_concentrator()
 		case 0:	// distance sensor
 			my_printf("Sensor TX to LoRA avg distance:%d [mm]\n\r",avg_distance_mm);
 			value=avg_distance_mm;
+
+        // Blink error LED 1–3 times based on distance range:
+      //   1 blink  = close   (< 500 mm)
+      //   2 blinks = medium  (500 – 1499 mm)
+      //   3 blinks = far     (>= 1500 mm)
+      if (avg_distance_mm <= 0)
+          blink_comm_LED(1);
+      else if (avg_distance_mm < 1000)
+          blink_comm_LED(2);
+      else
+          blink_comm_LED(3);
 			break;
 		case 1:	// temperature
 			//my_printf("Temperature: %d °C, Humidity: %d %%\r\n", int_temperature, int_humidity);
@@ -364,18 +533,120 @@ void sensors_data_sending_to_LoRA_concentrator()
 
 
 
-// ---------- UART RX from selected distance sensor complete callback ----------
+// ---------- Decode a complete 16-byte SEN0524 frame -------------------------
+// Returns 0 on success and fills *distance_mm_out.
+// Returns -1 on bad header/function mark, -2 on checksum error, -3 if invalid measurement.
+int decode_SEN0524(uint8_t *buf, uint16_t *distance_mm_out)
+{
+    if (buf[0] != SEN0524_FRAME_HEADER || buf[1] != SEN0524_FUNCTION_MARK)
+    {
+        set_error_LED(1);
+        return -1;
+    }
+
+    // Verify checksum: lowest byte of sum of bytes [0..14]
+    uint16_t sum = 0;
+    for (int i = 0; i < 15; i++)
+        sum += buf[i];
+    if ((sum & 0xFF) != buf[15])
+        return -2; // checksum mismatch
+
+    // dis_status: 0 = valid, 1 = invalid
+    /*
+    if (buf[11] != 0)
+        return -3; // sensor reports invalid measurement
+    */
+    // Distance encoded as int24 LE in bytes [8..10], unit = metres × 1000
+    uint32_t raw24 = (uint32_t)buf[8] | ((uint32_t)buf[9] << 8) | ((uint32_t)buf[10] << 16);
+    // Sign-extend 24-bit → 32-bit
+    int32_t dist_mm_i32;
+    if (raw24 & 0x800000)
+        dist_mm_i32 = (int32_t)(raw24 | 0xFF000000);
+    else
+        dist_mm_i32 = (int32_t)raw24;
+
+    // raw24 is already metres × 1000, i.e. millimetres
+    if (dist_mm_i32 < 0)
+        dist_mm_i32 = 0;
+
+    *distance_mm_out = (uint16_t)(dist_mm_i32 > 65535 ? 65535 : dist_mm_i32);
+    return 0;
+}
+
+
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance == USART2) {
-        //if (decode_ajsr04m(rx_buffer, &distance_mm) == 0)      	// selected ajsr04m sensor
-    	if (decode_distance_A01NYUB(rx_buffer, &distance_mm) == 0)  // selected DFROBOR A01NYUB sensor
+    if (huart->Instance != USART2) return;
+
+    uint8_t b = tof_rx_byte;
+
+    switch (tof_rx_state)
+    {
+    case TOF_STATE_WAIT_HEADER:
+        if (b == SEN0524_FRAME_HEADER)
         {
-        	distance_sensor_packet_ready = 1; // New valid measurement
+            tof_frame_buf[0] = b;
+            tof_frame_idx = 1;
+            tof_rx_state = TOF_STATE_WAIT_FUNC;
         }
-        // Restart reception
-        HAL_UART_Receive_IT(&huart2, rx_buffer, 4);
+        break;
+
+    case TOF_STATE_WAIT_FUNC:
+        if (b == SEN0524_FUNCTION_MARK)
+        {
+            tof_frame_buf[1] = b;
+            tof_frame_idx = 2;
+            tof_rx_state = TOF_STATE_COLLECT;
+        }
+        else if (b == SEN0524_FRAME_HEADER)
+        {
+            // New header appeared → resync (this is the key Python-like behaviour)
+            tof_frame_buf[0] = b;
+            tof_frame_idx = 1;
+            // stay in WAIT_FUNC
+        }
+        else
+        {
+            tof_rx_state = TOF_STATE_WAIT_HEADER;
+            tof_frame_idx = 0;
+        }
+        break;
+
+    case TOF_STATE_COLLECT:
+        // If we see a header in the middle of a frame → treat it as new start (very powerful!)
+        if (b == SEN0524_FRAME_HEADER && tof_frame_idx >= 3)
+        {
+            tof_frame_buf[0] = b;
+            tof_frame_idx = 1;
+            tof_rx_state = TOF_STATE_WAIT_FUNC;
+        }
+        else
+        {
+            tof_frame_buf[tof_frame_idx++] = b;
+
+            if (tof_frame_idx >= SEN0524_FRAME_LEN)
+            {
+                // Full frame collected
+                if (decode_SEN0524(tof_frame_buf, &distance_mm) == 0)
+                {
+                    distance_sensor_packet_ready = 1;
+                    last_valid_packet_tick = HAL_GetTick();   // <<< important!
+                }
+                // Always reset after full frame (good practice)
+                tof_rx_state = TOF_STATE_WAIT_HEADER;
+                tof_frame_idx = 0;
+            }
+        }
+        break;
+
+    default:
+        tof_rx_state = TOF_STATE_WAIT_HEADER;
+        tof_frame_idx = 0;
+        break;
     }
+
+    // Re-arm for next byte
+    HAL_UART_Receive_IT(&huart2, (uint8_t *)&tof_rx_byte, 1);
 }
 uint32_t global_100ms_counter=0;
 //timer period elapsed callback function
@@ -547,15 +818,12 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-	uint16_t periodic_timer=0;
 	uint32_t tick_counter;
-	uint32_t time_of_measurement_on_distance_sensor;
-	uint8_t select_sensor_number=1;
-#ifndef ONE_ULTRASONIC_SENSOR
-	uint32_t sum_for_avg=0;
-#endif
-	uint8_t err_cnt=0;
-	uint16_t print_out_cnt =0;
+	uint32_t time_of_mux_switch;          // controls MUX cycling (500 ms per port)
+	uint8_t  mux_slot          = 0;       // index into active_sensor_idx[]
+	uint8_t  err_cnt           = 0;
+	uint16_t print_out_cnt     = 0;
+	uint8_t  all_blocked       = 0;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -589,25 +857,30 @@ int main(void)
   LED_indicator_init();
   HAL_TIM_Base_Start_IT(&htim14);
 
-  //read_LoRA_433MHZ_module_config_data();
-  // Start first UART reception (non-blocking)
-	// --- Flush UART2 buffer before enabling interrupts ---
+  // --- Flush UART2 RX and start byte-by-byte interrupt reception ---
+  volatile uint32_t tmp;
+  tmp = huart2.Instance->RDR;
+  (void)tmp;
+  __HAL_UART_CLEAR_OREFLAG(&huart2);
+  tof_rx_state  = TOF_STATE_WAIT_HEADER;
+  tof_frame_idx = 0;
+  HAL_UART_Receive_IT(&huart2, (uint8_t *)&tof_rx_byte, 1);
 
-	volatile uint32_t tmp;
-	tmp = huart2.Instance->RDR;  // clear any junk
-	(void)tmp;
-	__HAL_UART_CLEAR_OREFLAG(&huart2);
-	HAL_UART_Receive_IT(&huart2, rx_buffer, 4);
-	tick_counter = HAL_GetTick();  // increased every 1ms
-	time_of_measurement_on_distance_sensor=  HAL_GetTick();
+  // --- Auto-detect which sensor ports have live sensors ---
+  probe_sensors();
+
+  // Start MUX on first active port
+  select_distance_sensor(active_sensor_idx[0] + 1);
+  mux_slot              = 0;
+  tick_counter          = HAL_GetTick();
+  time_of_mux_switch    = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  periodic_timer++;
-	  if((HAL_GetTick()-tick_counter)>1000)
+	  if ((HAL_GetTick() - tick_counter) > 1000)
 	  {
 		  tick_counter = HAL_GetTick();
 		  toggle_LED_WRK_indicator();
@@ -617,70 +890,72 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-	  if((HAL_GetTick()-time_of_measurement_on_distance_sensor)>500) // 500ms measurement on selected sensor
+	  // ── MUX cycling: spend 500 ms on each active sensor port ─────────────
+	  if ((HAL_GetTick() - time_of_mux_switch) > 500)
 	  {
-		  time_of_measurement_on_distance_sensor = HAL_GetTick();
-#ifdef ONE_ULTRASONIC_SENSOR
-		  select_sensor_number=2;   //SENSOR2 port
-		  avg_distance_mm = DistanceBuffer_GetAverage(select_sensor_number-1);
+		  time_of_mux_switch = HAL_GetTick();
 
-#else
-		  // calculate average of all used distance sensors
-		  sum_for_avg=0;
-		  for(int j=0;j<NUMBER_OF_DISTANCE_SENSORS_INSERTED_IN_PCB;j++)
-		  {
-			  sum_for_avg=sum_for_avg+DistanceBuffer_GetAverage(j);//Calculate the average of values stored in the buffer.
-		  }
-		  avg_distance_mm = sum_for_avg/NUMBER_OF_DISTANCE_SENSORS_INSERTED_IN_PCB;  //average for all sensors
-		  // debug only
-		  //my_printf("Selected MPX:%d AVG:%u\n\r",select_sensor_number,avg_distance_mm);
+		  // Compute Stage B filtered distance before switching away
+		  avg_distance_mm = compute_filtered_distance(&all_blocked);
+		  if (all_blocked)
+			  my_printf("WARNING: all sensors appear blocked — best-effort value: %u mm\n\r", avg_distance_mm);
 
-		  //select the next distance sensor
-		  select_sensor_number++;
-		  if(select_sensor_number>NUMBER_OF_DISTANCE_SENSORS_INSERTED_IN_PCB)
-			  select_sensor_number=1;
+		  // Advance to the next active sensor
+		  mux_slot++;
+		  if (mux_slot >= num_sensors_present)
+			  mux_slot = 0;
 
-
-#endif
-		  select_distance_sensor(select_sensor_number); // select the available sensor for distance measurement [1,2,3,4]
-		  DistanceBuffer_Clear(select_sensor_number-1);
-
+		  uint8_t next_idx = active_sensor_idx[mux_slot];
+		  select_distance_sensor(next_idx + 1);
+		  DistanceBuffer_Clear(next_idx);
 	  }
 
-
-
+	  // ── Process incoming TOF frame ────────────────────────────────────────
 	  if (distance_sensor_packet_ready)
 	  {
+		  set_error_LED(0);
+		  distance_sensor_packet_ready = 0;
 
-		  set_error_LED(0); //clear error
-		  distance_sensor_packet_ready=0;
-#ifdef ONE_ULTRASONIC_SENSOR
-		  select_sensor_number=2;
-#endif
-		  DistanceBuffer_Add(select_sensor_number-1,distance_mm); // add new measurement into circular buffer
+		  uint8_t cur_idx = active_sensor_idx[mux_slot];
+		  DistanceBuffer_Add(cur_idx, distance_mm);
 
-		  if((print_out_cnt++)>10)
+		  if ((print_out_cnt++) > 10)
 		  {
-			  my_printf("distance:%u [mm] on sensor NUM:%d \n\r",distance_mm,select_sensor_number); //debug only
-			  print_out_cnt =0;
+			  my_printf("distance:%u [mm] on port %d (buf median:%u)\n\r",
+			            distance_mm, cur_idx + 1, DistanceBuffer_GetMedian(cur_idx));
+			  print_out_cnt = 0;
 		  }
-		  //my_printf("AVG distance:%u [mm] on sensor:%d items:%d\n\r",
-		  //			 avg_distance_mm,select_sensor_number,DistanceBuffer_GetCount(select_sensor_number-1)); //debug only
-		  err_cnt=0;
+		  err_cnt = 0;
 	  }
 	  else
 	  {
 		  err_cnt++;
-		  if(err_cnt>5000){
-			  my_printf("Error: read distance sensor failed.\n\r");
-			  set_error_LED(1); //set error indication
+		  if (err_cnt > 5000) {
+			  my_printf("Error: no frame from distance sensor.\n\r");
+			  set_error_LED(1);
 		  }
 	  }
+
 	  HAL_IWDG_Refresh(&hiwdg);
-	  if(global_100ms_counter%SEND_TO_LORA_NET_EVERY_10_SEC==0) //every 10 sec send a message to LoRA concentrator
+
+	  // ── UART overrun / resync watchdog ────────────────────────────────────
+	  if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_ORE)) {
+		  __HAL_UART_CLEAR_OREFLAG(&huart2);
+		  tof_rx_state = TOF_STATE_WAIT_HEADER;
+		  tof_frame_idx = 0;
+	  }
+
+	  if (HAL_GetTick() - last_valid_packet_tick > 800) {
+		  tof_rx_state = TOF_STATE_WAIT_HEADER;
+		  tof_frame_idx = 0;
+		  last_valid_packet_tick = HAL_GetTick();
+	  }
+
+	  // ── LoRa TX every 10 s ────────────────────────────────────────────────
+	  if (global_100ms_counter % SEND_TO_LORA_NET_EVERY_10_SEC == 0)
 	  {
 		  SHT85_Read();
-		  my_printf("TX to LoRA concentrator at: %d [s]\n\r",global_100ms_counter/10);
+		  my_printf("TX to LoRA concentrator at: %d [s]\n\r", global_100ms_counter / 10);
 		  sensors_data_sending_to_LoRA_concentrator();
 	  }
   }
@@ -961,7 +1236,7 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 9600;
+  huart2.Init.BaudRate = 115200;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
