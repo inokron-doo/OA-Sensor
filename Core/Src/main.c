@@ -43,8 +43,9 @@
 // With a 10 s TX interval the active sensor collects up to ~100 samples.
 // We allocate 100 slots; 95th-percentile index = (count * 95) / 100 - 1.
 #define DIST_BUF_SIZE           100  // Per-sensor sample buffer (up to ~10 s @ 10 Hz)
-#define PROBE_TIMEOUT_MS        600  // Startup probe: wait this long per port for a valid frame
+#define PROBE_TIMEOUT_MS        1200 // Startup probe: wait this long per port for a valid frame
 #define SEND_TO_LORA_NET_EVERY_10_SEC 100  //100ms unit (10 s)
+#define REPROBE_INTERVAL_100MS  1800 // Re-probe sensors every 3 minutes (1800 x 100 ms)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -86,6 +87,7 @@ static void MX_TIM14_Init(void);
 /* USER CODE BEGIN PFP */
 int send_data_to_LoRA_network(uint32_t value_to_send);
 void set_error_LED(uint8_t val);
+void reprobe_sensors(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -229,6 +231,9 @@ uint8_t sensor_present[4]   = {0, 0, 0, 0};  // 1 if port [0..3] responded
 uint8_t num_sensors_present = 0;              // how many ports are active
 uint8_t active_sensor_idx[4];                 // indices (0-based) of active ports
 
+static uint8_t tx_slot           = 0;  // TX rotation position (shared with reprobe_sensors)
+static uint8_t reprobe_requested = 0;  // set to 1 to trigger an out-of-schedule reprobe
+
 /**
  * Add a new distance value (mm) into the flat buffer (fills up to DIST_BUF_SIZE).
  * Oldest samples are simply dropped once the buffer is full — caller should
@@ -300,6 +305,7 @@ void probe_sensors(void)
 
     for (uint8_t port = 1; port <= 4; port++) {
         select_distance_sensor(port);
+        HAL_Delay(100);   // let MUX settle before expecting frames
         distance_sensor_packet_ready = 0;
 
         uint32_t t_start = HAL_GetTick();
@@ -366,6 +372,68 @@ void select_distance_sensor(uint8_t sensor_nr_to_select)
 	}
 
 
+}
+
+/**
+ * Re-probe sensor ports at runtime.  Same detection logic as probe_sensors()
+ * but does not fall back to port 1 on total failure (keeps the old list
+ * instead).  Resets the TX rotation and sample buffers afterwards.
+ */
+void reprobe_sensors(void)
+{
+    uint8_t old_present[4];
+    for (uint8_t i = 0; i < 4; i++) old_present[i] = sensor_present[i];
+
+    my_printf("Re-probing sensor ports...\n\r");
+
+    uint8_t new_present[4] = {0, 0, 0, 0};
+    uint8_t new_active[4]  = {0, 0, 0, 0};
+    uint8_t new_count      = 0;
+
+    for (uint8_t port = 1; port <= 4; port++) {
+        select_distance_sensor(port);
+        HAL_Delay(100);
+        distance_sensor_packet_ready = 0;
+
+        uint32_t t_start = HAL_GetTick();
+        while ((HAL_GetTick() - t_start) < PROBE_TIMEOUT_MS) {
+            HAL_IWDG_Refresh(&hiwdg);
+            if (distance_sensor_packet_ready && distance_mm > 0)
+                break;
+        }
+
+        if (distance_sensor_packet_ready && distance_mm > 0) {
+            new_present[port - 1] = 1;
+            new_active[new_count] = port - 1;
+            new_count++;
+            if (!old_present[port - 1])
+                my_printf("  Port %d: GAINED (d=%u mm)\n\r", port, distance_mm);
+            else
+                my_printf("  Port %d: OK (d=%u mm)\n\r", port, distance_mm);
+        } else {
+            if (old_present[port - 1])
+                my_printf("  Port %d: LOST\n\r", port);
+        }
+
+        distance_sensor_packet_ready = 0;
+    }
+
+    if (new_count > 0) {
+        for (uint8_t i = 0; i < 4; i++) sensor_present[i]   = new_present[i];
+        for (uint8_t i = 0; i < 4; i++) active_sensor_idx[i] = new_active[i];
+        num_sensors_present = new_count;
+    } else {
+        my_printf("  No sensors found -- keeping old list\n\r");
+    }
+
+    // Clear all buffers, reset TX rotation, point MUX at first active sensor
+    for (uint8_t i = 0; i < 4; i++) DistanceBuffer_Clear(i);
+    tx_slot       = 0;
+    cur_dist_slot = 0;
+    if (num_sensors_present > 0)
+        select_distance_sensor(active_sensor_idx[0] + 1);
+
+    my_printf("Re-probe complete: %d sensor(s).\n\r", num_sensors_present);
 }
 
 uint8_t float_to_abs_u8(float x)
@@ -445,8 +513,6 @@ void sensors_data_sending_to_LoRA_concentrator()
 	// sensor so it has the full inter-TX interval (~10 s) to accumulate samples.
 	// The buffer of the sensor just sent is cleared so fresh samples are taken.
 
-	static uint8_t tx_slot = 0;   // current position in the rotation
-
 	uint8_t  num_slots   = 2 + num_sensors_present;   // temp + hum + N distance
 	uint16_t value       = 0;
 	uint8_t  type        = 0;
@@ -473,6 +539,8 @@ void sensors_data_sending_to_LoRA_concentrator()
 
 		type  = 0;
 		uint16_t p95 = DistanceBuffer_Get95thPercentile(idx);
+		if (DistanceBuffer_GetCount(idx) == 0)
+		    reprobe_requested = 1;   // sensor stopped responding -- schedule reprobe
 		my_printf("Sensor TX to LoRA port %d dist 95pct:%u mm (n=%u samples)\n\r",
 		          idx + 1, p95, DistanceBuffer_GetCount(idx));
 		value = p95;
@@ -794,8 +862,10 @@ int main(void)
 
   /* USER CODE BEGIN 1 */
 	uint32_t tick_counter;
-	uint8_t  err_cnt           = 0;
-	uint16_t print_out_cnt     = 0;
+	uint8_t  err_cnt            = 0;
+	uint16_t print_out_cnt      = 0;
+	uint32_t last_tx_100ms      = 0xFFFFFFFF;
+	uint32_t last_reprobe_100ms = 0;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -840,6 +910,7 @@ int main(void)
 
   // --- Auto-detect which sensor ports have live sensors ---
   probe_sensors();
+  last_reprobe_100ms = global_100ms_counter;
 
   // Point MUX at the first active distance sensor; it will accumulate samples
   // until the first TX event fires.
@@ -908,14 +979,25 @@ int main(void)
 	  }
 
 	  // ── LoRa TX every 10 s ────────────────────────────────────────────────
-	  if (global_100ms_counter % SEND_TO_LORA_NET_EVERY_10_SEC == 0)
+	  if (global_100ms_counter % SEND_TO_LORA_NET_EVERY_10_SEC == 0
+	      && global_100ms_counter != last_tx_100ms)
 	  {
+	      last_tx_100ms = global_100ms_counter;
 		  // Read T/H regardless — it's needed whenever a temp/hum slot fires
 		  SHT85_Read();
 		  my_printf("TX to LoRA concentrator at: %d [s]\n\r", global_100ms_counter / 10);
 		  sensors_data_sending_to_LoRA_concentrator();
 		  // cur_dist_slot is updated inside sensors_data_sending_to_LoRA_concentrator()
 		  // whenever it switches the MUX — no sync needed here.
+	  }
+
+	  // ── Periodic / on-demand sensor re-probe ─────────────────────────────
+	  if (reprobe_requested ||
+	      (global_100ms_counter - last_reprobe_100ms) >= REPROBE_INTERVAL_100MS)
+	  {
+	      reprobe_sensors();
+	      last_reprobe_100ms = global_100ms_counter;
+	      reprobe_requested  = 0;
 	  }
   }
   /* USER CODE END 3 */
