@@ -38,14 +38,15 @@
 /* USER CODE BEGIN PD */
 #define SENSOR_DEVICE_ID	1	//UNIQUE sensor ID, change this to unique for sensor nodes
 
-// ── Distance sensor pipeline tunables ────────────────────────────────────────
+// Distance sensor pipeline tunables.
 // The sensor outputs ~10 frames/s at 115200 baud.
 // With a 10 s TX interval the active sensor collects up to ~100 samples.
-// We allocate 100 slots; 95th-percentile index = (count * 95) / 100 - 1.
+// We allocate 100 slots; 95th-percentile index = (count * 95) / 100.
 #define DIST_BUF_SIZE           100  // Per-sensor sample buffer (up to ~10 s @ 10 Hz)
 #define PROBE_TIMEOUT_MS        1200 // Startup probe: wait this long per port for a valid frame
-#define SEND_TO_LORA_NET_EVERY_10_SEC 100  //100ms unit (10 s)
+#define SEND_TO_LORA_NET_EVERY_10_SEC 100  // 100 ms units (10 s)
 #define REPROBE_INTERVAL_100MS  1800 // Re-probe sensors every 3 minutes (1800 x 100 ms)
+#define NO_FRAME_TIMEOUT_MS     3000 // Light error LED if no valid frame arrives within this time
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -88,19 +89,20 @@ static void MX_TIM14_Init(void);
 int send_data_to_LoRA_network(uint32_t value_to_send);
 void set_error_LED(uint8_t val);
 void reprobe_sensors(void);
+void select_distance_sensor(uint8_t sensor_nr_to_select);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-// ── DFRobot SEN0524 TOF sensor (921600 baud, 16-byte active-output frames) ──
+// DFRobot SEN0524 TOF sensor: 115200 baud, 16-byte active-output frames.
 // Frame layout:
 //  [0]      Frame Header    0x57
 //  [1]      Function Mark   0x00
 //  [2]      reserved
 //  [3]      id              module ID
 //  [4..7]   system_time     uint32 LE (ms)
-//  [8..10]  dis*1000        int24  LE (metres × 1000  →  mm when ×1)
+//  [8..10]  dis*1000        int24  LE (metres * 1000, i.e. mm)
 //  [11]     dis_status      0=valid, 1=invalid
 //  [12..13] signal_strength uint16 LE
 //  [14]     range_precision uint8 (cm)
@@ -135,7 +137,7 @@ static uint8_t cur_dist_slot = 0;
 void vprint(const char *fmt, va_list argp)
 {
     char string[200];
-    if(0 < vsprintf(string,fmt,argp)) // build string
+    if(0 < vsnprintf(string, sizeof(string), fmt, argp)) // build string (bounded)
     {
         HAL_UART_Transmit(&huart2, (uint8_t*)string, strlen(string), 0xffffff); // send message via UART
     }
@@ -155,13 +157,21 @@ uint32_t MCU_Unique_ID()
 	uint32_t uid1 = *(uint32_t *)0x1FFFF7B0;
 	uint32_t uid2 = *(uint32_t *)0x1FFFF7B4;
 
-	// Mix the values to create a good seed
-	uint32_t seed = uid0 ^ uid1 ^ uid2;
-	return seed;
+	// Fold the three words into a single 32-bit identifier
+	return uid0 ^ uid1 ^ uid2;
 }
 
-// Ultrasonic distance measurement
-// ---------- Decode AJ-SR04M packet ----------
+// ---------------------------------------------------------------------------
+// Alternative distance-sensor decoders.
+//
+// The active build uses the DFRobot SEN0524 TOF sensor (decoded in
+// decode_SEN0524 / the UART2 RX callback). The two decoders below are kept
+// for board variants fitted with an ultrasonic sensor instead; they are not
+// called in the SEN0524 data path. Wire one into HAL_UART_RxCpltCallback if
+// the corresponding sensor is used.
+// ---------------------------------------------------------------------------
+
+// Decode an AJ-SR04M ultrasonic packet (4 bytes: 0xFF, MSB, LSB, checksum).
 int decode_ajsr04m(uint8_t *buf, uint16_t *distance_mm)
 {
     if (buf[0] != 0xFF) {
@@ -182,15 +192,7 @@ int decode_ajsr04m(uint8_t *buf, uint16_t *distance_mm)
     return 0; // OK
 }
 
-// https://www.dfrobot.com/product-1934.html
-// https://wiki.dfrobot.com/A01NYUB%20Waterproof%20Ultrasonic%20Sensor%20SKU_SEN0313
-// -- connection to LoRA Sensor Network PCB V 0.1 --
-// Sensor     	PCB SENSOR[1,2,3,4] port
-// Red=5V 		+5V
-// Black=GND    GND
-// Blue=Rx      RX
-// Green=Tx     TX
-//------------------------
+// Decode a DFRobot A01NYUB waterproof ultrasonic packet
 int decode_distance_A01NYUB(uint8_t *buf, uint16_t *distance_mm)
 {
 	if (buf[0] != 0xFF) {
@@ -226,7 +228,7 @@ typedef struct {
 
 DistanceBuffer_t distBuf[4];  //buffer for 1,2,3,4 distance sensors
 
-// ── Sensor auto-detection (set at startup by probe_sensors()) ────────────────
+// Sensor auto-detection (set at startup by probe_sensors())
 uint8_t sensor_present[4]   = {0, 0, 0, 0};  // 1 if port [0..3] responded
 uint8_t num_sensors_present = 0;              // how many ports are active
 uint8_t active_sensor_idx[4];                 // indices (0-based) of active ports
@@ -236,14 +238,14 @@ static uint8_t reprobe_requested = 0;  // set to 1 to trigger an out-of-schedule
 
 /**
  * Add a new distance value (mm) into the flat buffer (fills up to DIST_BUF_SIZE).
- * Oldest samples are simply dropped once the buffer is full — caller should
+ * Oldest samples are simply dropped once the buffer is full - caller should
  * clear the buffer after reading the result.
  */
 void DistanceBuffer_Add(uint8_t i, uint16_t value)
 {
     if (distBuf[i].count < DIST_BUF_SIZE)
         distBuf[i].buf[distBuf[i].count++] = value;
-    // else: buffer full — discard; caller must clear between TX events
+    // else: buffer full - discard; caller must clear between TX events
 }
 
 /**
@@ -251,7 +253,7 @@ void DistanceBuffer_Add(uint8_t i, uint16_t value)
  * value at the 95 % rank.  Returns 0 if buffer is empty.
  *
  * With N samples the 95th-percentile index = (N * 95) / 100
- * (integer division; for N=100 → index 95, for N=10 → index 9).
+ * (integer division; for N=100 gives index 95, for N=10 gives index 9).
  */
 uint16_t DistanceBuffer_Get95thPercentile(uint8_t i)
 {
@@ -263,7 +265,7 @@ uint16_t DistanceBuffer_Get95thPercentile(uint8_t i)
     for (uint8_t j = 0; j < n; j++)
         tmp[j] = distBuf[i].buf[j];
 
-    // Insertion sort (fast enough for ≤100 elements on a Cortex-M0)
+    // Insertion sort (n <= 100, runs once per TX interval)
     for (uint8_t j = 1; j < n; j++) {
         uint16_t key = tmp[j];
         int8_t   k   = (int8_t)j - 1;
@@ -333,7 +335,7 @@ void probe_sensors(void)
 
     // If nothing found, fall back to port 1 so the system still runs
     if (num_sensors_present == 0) {
-        my_printf("WARNING: no sensors detected — defaulting to port 1\n\r");
+        my_printf("WARNING: no sensors detected - defaulting to port 1\n\r");
         sensor_present[0]      = 1;
         active_sensor_idx[0]   = 0;
         num_sensors_present    = 1;
@@ -450,8 +452,9 @@ void SHT85_Read(void)
 {
     uint8_t cmd[2] = {0x24, 0x00}; // Single shot, high repeatability, no clock stretching
 
-    // Send measurement command
-    HAL_I2C_Master_Transmit(&hi2c1, SHT85_ADDR, cmd, 2, HAL_MAX_DELAY);
+    // Send measurement command. Use a finite timeout (matching the receive
+    // below) so a missing/stuck sensor can't block the main loop indefinitely.
+    HAL_I2C_Master_Transmit(&hi2c1, SHT85_ADDR, cmd, 2, 100);
 
     // Wait for measurement (~15 ms typical)
     HAL_Delay(20);
@@ -503,13 +506,12 @@ void blink_comm_LED(uint8_t times)
 
 void sensors_data_sending_to_LoRA_concentrator()
 {
-	// ── TX rotation ──────────────────────────────────────────────────────────
-	// Slot layout:
-	//   0          → temperature
-	//   1          → humidity
-	//   2 .. 2+N-1 → distance sensors (active_sensor_idx[0..N-1])
+	// TX rotation slot layout:
+	//   0          -> temperature
+	//   1          -> humidity
+	//   2 .. 2+N-1 -> distance sensors (active_sensor_idx[0..N-1])
 	//
-	// After transmitting a distance slot the MUX is moved to the NEXT distance
+	// After transmitting a distance slot the MUX is moved to the next distance
 	// sensor so it has the full inter-TX interval (~10 s) to accumulate samples.
 	// The buffer of the sensor just sent is cleared so fresh samples are taken.
 
@@ -518,7 +520,7 @@ void sensors_data_sending_to_LoRA_concentrator()
 	uint8_t  type        = 0;
 
 	if (tx_slot == 0) {
-		// ── Temperature ──
+		// Temperature
 		type = 1;
 		if ((int_temperature & 0x80) > 0)
 			my_printf("Sensor TX to LoRA temperature:-%d [C]\n\r", int_temperature & 0x7F);
@@ -527,13 +529,13 @@ void sensors_data_sending_to_LoRA_concentrator()
 		value = (uint16_t)(int_temperature & 0xFF);
 
 	} else if (tx_slot == 1) {
-		// ── Humidity ──
+		// Humidity
 		type = 2;
 		my_printf("Sensor TX to LoRA humidity:%d [%%]\n\r", int_humidity);
 		value = (uint16_t)(uint8_t)int_humidity;
 
 	} else {
-		// ── Distance sensor (slot 2 .. 2+N-1) ──
+		// Distance sensor (slot 2 .. 2+N-1)
 		uint8_t dist_slot = tx_slot - 2;              // 0-based index into active sensors
 		uint8_t idx       = active_sensor_idx[dist_slot];  // 0-based port index
 
@@ -546,14 +548,14 @@ void sensors_data_sending_to_LoRA_concentrator()
 		value = p95;
 
 		// Blink COMM LED to indicate distance range
-		if (value <= 0)
+		if (value == 0)
 			blink_comm_LED(1);
 		else if (value < 1000)
 			blink_comm_LED(2);
 		else
 			blink_comm_LED(3);
 
-		// Clear this sensor's buffer — fresh accumulation starts now
+		// Clear this sensor's buffer - fresh accumulation starts now
 		DistanceBuffer_Clear(idx);
 
 		// Switch MUX to the NEXT distance sensor immediately so it gets
@@ -575,9 +577,9 @@ void sensors_data_sending_to_LoRA_concentrator()
 
 
 
-// ---------- Decode a complete 16-byte SEN0524 frame -------------------------
-// Returns 0 on success and fills *distance_mm_out.
-// Returns -1 on bad header/function mark, -2 on checksum error, -3 if invalid measurement.
+// Decode a complete 16-byte SEN0524 frame and fill *distance_mm_out.
+// Returns 0 on success, -1 on bad header/function mark, -2 on checksum error.
+// (The sensor's dis_status invalid flag is currently not enforced - see below.)
 int decode_SEN0524(uint8_t *buf, uint16_t *distance_mm_out)
 {
     if (buf[0] != SEN0524_FRAME_HEADER || buf[1] != SEN0524_FUNCTION_MARK)
@@ -598,16 +600,16 @@ int decode_SEN0524(uint8_t *buf, uint16_t *distance_mm_out)
     if (buf[11] != 0)
         return -3; // sensor reports invalid measurement
     */
-    // Distance encoded as int24 LE in bytes [8..10], unit = metres × 1000
+    // Distance encoded as int24 LE in bytes [8..10], unit = metres * 1000 (mm)
     uint32_t raw24 = (uint32_t)buf[8] | ((uint32_t)buf[9] << 8) | ((uint32_t)buf[10] << 16);
-    // Sign-extend 24-bit → 32-bit
+    // Sign-extend 24-bit to 32-bit
     int32_t dist_mm_i32;
     if (raw24 & 0x800000)
         dist_mm_i32 = (int32_t)(raw24 | 0xFF000000);
     else
         dist_mm_i32 = (int32_t)raw24;
 
-    // raw24 is already metres × 1000, i.e. millimetres
+    // raw24 is already metres * 1000, i.e. millimetres
     if (dist_mm_i32 < 0)
         dist_mm_i32 = 0;
 
@@ -642,7 +644,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         }
         else if (b == SEN0524_FRAME_HEADER)
         {
-            // New header appeared → resync (this is the key Python-like behaviour)
+            // A new header arrived where the function mark was expected:
+            // restart the frame here instead of discarding the byte.
             tof_frame_buf[0] = b;
             tof_frame_idx = 1;
             // stay in WAIT_FUNC
@@ -655,7 +658,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         break;
 
     case TOF_STATE_COLLECT:
-        // If we see a header in the middle of a frame → treat it as new start (very powerful!)
+        // A header byte mid-frame most likely means the previous frame was
+        // truncated; treat it as the start of a new frame and resync.
         if (b == SEN0524_FRAME_HEADER && tof_frame_idx >= 3)
         {
             tof_frame_buf[0] = b;
@@ -672,9 +676,9 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                 if (decode_SEN0524(tof_frame_buf, &distance_mm) == 0)
                 {
                     distance_sensor_packet_ready = 1;
-                    last_valid_packet_tick = HAL_GetTick();   // <<< important!
+                    last_valid_packet_tick = HAL_GetTick();
                 }
-                // Always reset after full frame (good practice)
+                // Reset for the next frame
                 tof_rx_state = TOF_STATE_WAIT_HEADER;
                 tof_frame_idx = 0;
             }
@@ -699,7 +703,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
 	static uint16_t divider_counter = 0;
     if(htim == &htim6)
-    {	//timer 6 overflow
+    {	// TIM6 is configured by CubeMX but not started; reserved for future use.
 
     }
     if(htim == &htim14)
@@ -822,7 +826,10 @@ int send_data_to_LoRA_network(uint32_t value_to_send)
 	return 0;
 }
 
-int read_LoRA_433MHZ_module_config_data()  // not in use for 868Mhz LoRA
+// Read back the configuration registers of a 433 MHz LoRa module.
+// Kept for boards using the 433 MHz module variant; the default 868 MHz
+// module does not use this, so it is not called in the active firmware.
+int read_LoRA_433MHZ_module_config_data()
 {
 
 	uint8_t buffer[6];
@@ -862,10 +869,10 @@ int main(void)
 
   /* USER CODE BEGIN 1 */
 	uint32_t tick_counter;
-	uint8_t  err_cnt            = 0;
 	uint16_t print_out_cnt      = 0;
 	uint32_t last_tx_100ms      = 0xFFFFFFFF;
 	uint32_t last_reprobe_100ms = 0;
+	uint32_t last_frame_ms      = 0;  // tick of the last frame consumed by the main loop
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -916,7 +923,8 @@ int main(void)
   // until the first TX event fires.
   if (num_sensors_present > 0)
       select_distance_sensor(active_sensor_idx[cur_dist_slot] + 1);
-  tick_counter = HAL_GetTick();
+  tick_counter   = HAL_GetTick();
+  last_frame_ms  = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -933,11 +941,12 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-	  // ── Accumulate TOF frames into the current distance sensor's buffer ───
+	  // Accumulate TOF frames into the current distance sensor's buffer.
 	  if (distance_sensor_packet_ready)
 	  {
 		  set_error_LED(0);
 		  distance_sensor_packet_ready = 0;
+		  last_frame_ms = HAL_GetTick();
 
 		  // cur_dist_slot tracks which active sensor port the MUX is on.
 		  // sensors_data_sending_to_LoRA_concentrator() advances it (and the
@@ -952,20 +961,19 @@ int main(void)
 			            distance_mm, cur_idx + 1, DistanceBuffer_GetCount(cur_idx));
 			  print_out_cnt = 0;
 		  }
-		  err_cnt = 0;
 	  }
-	  else
+	  else if (HAL_GetTick() - last_frame_ms > NO_FRAME_TIMEOUT_MS)
 	  {
-		  err_cnt++;
-		  if (err_cnt > 5000) {
-			  my_printf("Error: no frame from distance sensor.\n\r");
-			  set_error_LED(1);
-		  }
+		  // No valid frame for a while: flag the fault and let the reprobe /
+		  // resync logic below recover. Time-based, not iteration-based, since
+		  // the main loop spins far faster than frames arrive (~10 Hz).
+		  my_printf("Error: no frame from distance sensor.\n\r");
+		  set_error_LED(1);
 	  }
 
 	  HAL_IWDG_Refresh(&hiwdg);
 
-	  // ── UART overrun / resync watchdog ────────────────────────────────────
+	  // UART overrun / resync watchdog
 	  if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_ORE)) {
 		  __HAL_UART_CLEAR_OREFLAG(&huart2);
 		  tof_rx_state = TOF_STATE_WAIT_HEADER;
@@ -978,20 +986,20 @@ int main(void)
 		  last_valid_packet_tick = HAL_GetTick();
 	  }
 
-	  // ── LoRa TX every 10 s ────────────────────────────────────────────────
+	  // LoRa TX every 10 s
 	  if (global_100ms_counter % SEND_TO_LORA_NET_EVERY_10_SEC == 0
 	      && global_100ms_counter != last_tx_100ms)
 	  {
 	      last_tx_100ms = global_100ms_counter;
-		  // Read T/H regardless — it's needed whenever a temp/hum slot fires
+		  // Read T/H every interval - needed whenever a temp/hum slot fires
 		  SHT85_Read();
 		  my_printf("TX to LoRA concentrator at: %d [s]\n\r", global_100ms_counter / 10);
 		  sensors_data_sending_to_LoRA_concentrator();
 		  // cur_dist_slot is updated inside sensors_data_sending_to_LoRA_concentrator()
-		  // whenever it switches the MUX — no sync needed here.
+		  // whenever it switches the MUX, so no sync is needed here.
 	  }
 
-	  // ── Periodic / on-demand sensor re-probe ─────────────────────────────
+	  // Periodic / on-demand sensor re-probe
 	  if (reprobe_requested ||
 	      (global_100ms_counter - last_reprobe_100ms) >= REPROBE_INTERVAL_100MS)
 	  {
