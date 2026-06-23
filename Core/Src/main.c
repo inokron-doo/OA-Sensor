@@ -43,10 +43,11 @@
 // With a 10 s TX interval the active sensor collects up to ~100 samples.
 // We allocate 100 slots; 95th-percentile index = (count * 95) / 100.
 #define DIST_BUF_SIZE           100  // Per-sensor sample buffer (up to ~10 s @ 10 Hz)
-#define PROBE_TIMEOUT_MS        1200 // Startup probe: wait this long per port for a valid frame
+#define PROBE_TIMEOUT_MS        2500 // Startup probe: wait this long per port for a valid frame
 #define SEND_TO_LORA_NET_EVERY_10_SEC 100  // 100 ms units (10 s)
 #define REPROBE_INTERVAL_100MS  1800 // Re-probe sensors every 3 minutes (1800 x 100 ms)
 #define NO_FRAME_TIMEOUT_MS     3000 // Light error LED if no valid frame arrives within this time
+#define DROP_AFTER_MISSES       3    // Consecutive failed reprobes before a known sensor is dropped
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -73,6 +74,7 @@ UART_HandleTypeDef huart2;
 uint8_t sht85_data[6];
 float temperature, humidity;
 int8_t int_temperature, int_humidity;
+uint8_t sht85_ok = 0;  // 1 after a successful I2C read, 0 if sensor absent/failed
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -125,7 +127,13 @@ static          uint8_t      tof_frame_buf[SEN0524_FRAME_LEN];
 static volatile uint8_t      tof_frame_idx = 0;   // bytes collected so far
 
 uint16_t distance_mm        = 0;   // Latest decoded distance (mm)
-volatile uint8_t distance_sensor_packet_ready = 0;  // Flag: new packet available
+volatile uint8_t distance_sensor_packet_ready = 0;  // Flag: new VALID measurement available
+// Set whenever a structurally-valid frame (good header + checksum) is decoded,
+// regardless of whether the measurement itself is valid. This is the liveness
+// test used by probe_sensors()/reprobe_sensors() and the no-frame watchdog, so a
+// sensor that is alive but currently reading invalid (fog, empty trough,
+// dead-zone -> distance 0) is NOT mistaken for absent.
+volatile uint8_t tof_frame_seen = 0;
 static uint32_t last_valid_packet_tick = 0;   // for the watchdog
 
 // Current distance sensor slot (index into active_sensor_idx[]) that the MUX
@@ -230,6 +238,7 @@ DistanceBuffer_t distBuf[4];  //buffer for 1,2,3,4 distance sensors
 
 // Sensor auto-detection (set at startup by probe_sensors())
 uint8_t sensor_present[4]   = {0, 0, 0, 0};  // 1 if port [0..3] responded
+uint8_t sensor_miss[4]      = {0, 0, 0, 0};  // consecutive reprobe misses per port (hysteresis)
 uint8_t num_sensors_present = 0;              // how many ports are active
 uint8_t active_sensor_idx[4];                 // indices (0-based) of active ports
 
@@ -308,27 +317,28 @@ void probe_sensors(void)
     for (uint8_t port = 1; port <= 4; port++) {
         select_distance_sensor(port);
         HAL_Delay(100);   // let MUX settle before expecting frames
-        distance_sensor_packet_ready = 0;
+        tof_frame_seen = 0;
 
         uint32_t t_start = HAL_GetTick();
         while ((HAL_GetTick() - t_start) < PROBE_TIMEOUT_MS) {
             HAL_IWDG_Refresh(&hiwdg);
-            if (distance_sensor_packet_ready && distance_mm > 0) {
+            if (tof_frame_seen) {   // any structurally-valid frame == sensor alive
                 break;
             }
         }
 
-        if (distance_sensor_packet_ready && distance_mm > 0) {
+        if (tof_frame_seen) {
             sensor_present[port - 1] = 1;
+            sensor_miss[port - 1]    = 0;
             active_sensor_idx[num_sensors_present] = port - 1;
             num_sensors_present++;
-            my_printf("  Port %d: FOUND (d=%u mm)\n\r", port, distance_mm);
+            my_printf("  Port %d: FOUND\n\r", port);
         } else {
             sensor_present[port - 1] = 0;
             my_printf("  Port %d: not detected\n\r", port);
         }
 
-        distance_sensor_packet_ready = 0;
+        tof_frame_seen = 0;
     }
 
     my_printf("Probe complete: %d sensor(s) found.\n\r", num_sensors_present);
@@ -377,9 +387,13 @@ void select_distance_sensor(uint8_t sensor_nr_to_select)
 }
 
 /**
- * Re-probe sensor ports at runtime.  Same detection logic as probe_sensors()
- * but does not fall back to port 1 on total failure (keeps the old list
- * instead).  Resets the TX rotation and sample buffers afterwards.
+ * Re-probe sensor ports at runtime.  Detects liveness via a structurally-valid
+ * frame (tof_frame_seen), NOT a positive distance, so a sensor that is alive but
+ * currently reading invalid (fog, empty trough, dead-zone) is not mistaken for
+ * absent.  A known sensor is only dropped after DROP_AFTER_MISSES consecutive
+ * failed reprobes (hysteresis), so a single unlucky probe window can't prune it.
+ * Never falls back to port 1 on total failure (keeps the old list).  Resets the
+ * TX rotation and sample buffers afterwards.
  */
 void reprobe_sensors(void)
 {
@@ -389,39 +403,57 @@ void reprobe_sensors(void)
     my_printf("Re-probing sensor ports...\n\r");
 
     uint8_t new_present[4] = {0, 0, 0, 0};
-    uint8_t new_active[4]  = {0, 0, 0, 0};
-    uint8_t new_count      = 0;
 
     for (uint8_t port = 1; port <= 4; port++) {
+        uint8_t i = port - 1;
         select_distance_sensor(port);
         HAL_Delay(100);
-        distance_sensor_packet_ready = 0;
+        tof_frame_seen = 0;
 
         uint32_t t_start = HAL_GetTick();
         while ((HAL_GetTick() - t_start) < PROBE_TIMEOUT_MS) {
             HAL_IWDG_Refresh(&hiwdg);
-            if (distance_sensor_packet_ready && distance_mm > 0)
+            if (tof_frame_seen)
                 break;
         }
 
-        if (distance_sensor_packet_ready && distance_mm > 0) {
-            new_present[port - 1] = 1;
-            new_active[new_count] = port - 1;
-            new_count++;
-            if (!old_present[port - 1])
-                my_printf("  Port %d: GAINED (d=%u mm)\n\r", port, distance_mm);
+        if (tof_frame_seen) {
+            // Sensor responded this round -> present, miss counter cleared.
+            new_present[i] = 1;
+            sensor_miss[i] = 0;
+            if (!old_present[i])
+                my_printf("  Port %d: GAINED\n\r", port);
             else
-                my_printf("  Port %d: OK (d=%u mm)\n\r", port, distance_mm);
+                my_printf("  Port %d: OK\n\r", port);
+        } else if (old_present[i]) {
+            // Known sensor missed this round. Keep it (sticky) until it has
+            // missed DROP_AFTER_MISSES reprobes in a row, then drop it.
+            sensor_miss[i]++;
+            if (sensor_miss[i] >= DROP_AFTER_MISSES) {
+                new_present[i] = 0;
+                my_printf("  Port %d: LOST (after %d misses)\n\r", port, sensor_miss[i]);
+            } else {
+                new_present[i] = 1;
+                my_printf("  Port %d: stale (%d/%d misses)\n\r",
+                          port, sensor_miss[i], DROP_AFTER_MISSES);
+            }
         } else {
-            if (old_present[port - 1])
-                my_printf("  Port %d: LOST\n\r", port);
+            new_present[i] = 0;   // was absent, still absent
         }
 
-        distance_sensor_packet_ready = 0;
+        tof_frame_seen = 0;
+    }
+
+    // Rebuild the active-sensor list (compacted port indices) from new_present.
+    uint8_t new_active[4] = {0, 0, 0, 0};
+    uint8_t new_count     = 0;
+    for (uint8_t i = 0; i < 4; i++) {
+        if (new_present[i])
+            new_active[new_count++] = i;
     }
 
     if (new_count > 0) {
-        for (uint8_t i = 0; i < 4; i++) sensor_present[i]   = new_present[i];
+        for (uint8_t i = 0; i < 4; i++) sensor_present[i]    = new_present[i];
         for (uint8_t i = 0; i < 4; i++) active_sensor_idx[i] = new_active[i];
         num_sensors_present = new_count;
     } else {
@@ -430,6 +462,7 @@ void reprobe_sensors(void)
 
     // Clear all buffers, reset TX rotation, point MUX at first active sensor
     for (uint8_t i = 0; i < 4; i++) DistanceBuffer_Clear(i);
+    distance_sensor_packet_ready = 0;
     tx_slot       = 0;
     cur_dist_slot = 0;
     if (num_sensors_present > 0)
@@ -471,22 +504,20 @@ void SHT85_Read(void)
 
         // Convert to humidity (%RH)
         humidity = 100.0f * ((float)rawHum / 65535.0f);
-    }
-    else
-    {
-        temperature = 0.0f;
-        humidity = 0.0f;
-    }
 
-    if(temperature<0)
-    {
-    	int_temperature=((int8_t)float_to_abs_u8(temperature))|0x80;
+        if (temperature < 0)
+            int_temperature = ((int8_t)float_to_abs_u8(temperature)) | 0x80;
+        else
+            int_temperature = ((int8_t)temperature) & 0x7F;
+        int_humidity = (int8_t)humidity;
+
+        sht85_ok = 1;
     }
     else
     {
-    	int_temperature=((int8_t)temperature)&0x7F;
+        sht85_ok = 0;
+        my_printf("SHT85 read failed - no sensor?\n\r");
     }
-    int_humidity=(int8_t) humidity;
 
 }
 
@@ -518,21 +549,32 @@ void sensors_data_sending_to_LoRA_concentrator()
 	uint8_t  num_slots   = 2 + num_sensors_present;   // temp + hum + N distance
 	uint16_t value       = 0;
 	uint8_t  type        = 0;
+	uint8_t  skip_tx     = 0;  // set when a slot has no valid data to send
 
 	if (tx_slot == 0) {
 		// Temperature
 		type = 1;
-		if ((int_temperature & 0x80) > 0)
-			my_printf("Sensor TX to LoRA temperature:-%d [C]\n\r", int_temperature & 0x7F);
-		else
-			my_printf("Sensor TX to LoRA temperature:%d [C]\n\r", int_temperature & 0x7F);
-		value = (uint16_t)(int_temperature & 0xFF);
+		if (!sht85_ok) {
+			my_printf("Sensor TX: SHT85 absent, skipping temperature slot\n\r");
+			skip_tx = 1;
+		} else {
+			if ((int_temperature & 0x80) > 0)
+				my_printf("Sensor TX to LoRA temperature:-%d [C]\n\r", int_temperature & 0x7F);
+			else
+				my_printf("Sensor TX to LoRA temperature:%d [C]\n\r", int_temperature & 0x7F);
+			value = (uint16_t)(int_temperature & 0xFF);
+		}
 
 	} else if (tx_slot == 1) {
 		// Humidity
 		type = 2;
-		my_printf("Sensor TX to LoRA humidity:%d [%%]\n\r", int_humidity);
-		value = (uint16_t)(uint8_t)int_humidity;
+		if (!sht85_ok) {
+			my_printf("Sensor TX: SHT85 absent, skipping humidity slot\n\r");
+			skip_tx = 1;
+		} else {
+			my_printf("Sensor TX to LoRA humidity:%d [%%]\n\r", int_humidity);
+			value = (uint16_t)(uint8_t)int_humidity;
+		}
 
 	} else {
 		// Distance sensor (slot 2 .. 2+N-1)
@@ -541,8 +583,11 @@ void sensors_data_sending_to_LoRA_concentrator()
 
 		type  = 0;
 		uint16_t p95 = DistanceBuffer_Get95thPercentile(idx);
-		if (DistanceBuffer_GetCount(idx) == 0)
-		    reprobe_requested = 1;   // sensor stopped responding -- schedule reprobe
+		// An empty window just means no VALID measurements this interval (e.g.
+		// the sensor was reading invalid). Detection/removal is handled by the
+		// periodic reprobe with hysteresis, so do NOT force an out-of-schedule
+		// reprobe here -- doing so churned the active list and cleared every
+		// sensor's buffer on each empty window, dragging healthy sensors down too.
 		my_printf("Sensor TX to LoRA port %d dist 95pct:%u mm (n=%u samples)\n\r",
 		          idx + 1, p95, DistanceBuffer_GetCount(idx));
 		value = p95;
@@ -566,8 +611,10 @@ void sensors_data_sending_to_LoRA_concentrator()
 		cur_dist_slot = next_dist_slot;  // keep main loop in sync
 	}
 
-	uint32_t data = encode_message(SENSOR_DEVICE_ID, type, value);
-	send_data_to_LoRA_network(data);
+	if (!skip_tx) {
+		uint32_t data = encode_message(SENSOR_DEVICE_ID, type, value);
+		send_data_to_LoRA_network(data);
+	}
 
 	// Advance rotation
 	tx_slot++;
@@ -577,10 +624,16 @@ void sensors_data_sending_to_LoRA_concentrator()
 
 
 
-// Decode a complete 16-byte SEN0524 frame and fill *distance_mm_out.
-// Returns 0 on success, -1 on bad header/function mark, -2 on checksum error.
-// (The sensor's dis_status invalid flag is currently not enforced - see below.)
-int decode_SEN0524(uint8_t *buf, uint16_t *distance_mm_out)
+// Decode a complete 16-byte SEN0524 frame.
+//   *distance_mm_out <- decoded distance (mm), clamped to >= 0
+//   *meas_valid_out  <- 1 if the sensor flags the measurement valid (dis_status==0),
+//                       0 if invalid. A structurally-sound frame carrying an invalid
+//                       measurement still returns 0 (success): the sensor is alive,
+//                       the reading just isn't usable. Liveness vs. usable-sample is
+//                       decided by the caller, not by dropping the frame here.
+// Returns 0 on a structurally-valid frame (good header + checksum),
+//        -1 on bad header/function mark, -2 on checksum error.
+int decode_SEN0524(uint8_t *buf, uint16_t *distance_mm_out, uint8_t *meas_valid_out)
 {
     if (buf[0] != SEN0524_FRAME_HEADER || buf[1] != SEN0524_FUNCTION_MARK)
     {
@@ -595,11 +648,15 @@ int decode_SEN0524(uint8_t *buf, uint16_t *distance_mm_out)
     if ((sum & 0xFF) != buf[15])
         return -2; // checksum mismatch
 
-    // dis_status: 0 = valid, 1 = invalid
-    /*
-    if (buf[11] != 0)
-        return -3; // sensor reports invalid measurement
-    */
+    // dis_status (buf[11]) is intentionally ignored: the two SEN0524 sensor
+    // generations in the field use opposite conventions (one reports 0 on a
+    // valid measurement, the other reports 1), so the flag is not portable.
+    // Any frame that passes the header + checksum checks is treated as a usable
+    // sample; out-of-range / noisy readings are rejected downstream by the 95th
+    // percentile filter instead.
+    (void)buf[11];
+    *meas_valid_out = 1;
+
     // Distance encoded as int24 LE in bytes [8..10], unit = metres * 1000 (mm)
     uint32_t raw24 = (uint32_t)buf[8] | ((uint32_t)buf[9] << 8) | ((uint32_t)buf[10] << 16);
     // Sign-extend 24-bit to 32-bit
@@ -673,10 +730,22 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             if (tof_frame_idx >= SEN0524_FRAME_LEN)
             {
                 // Full frame collected
-                if (decode_SEN0524(tof_frame_buf, &distance_mm) == 0)
+                uint16_t d          = 0;
+                uint8_t  meas_valid = 0;
+                if (decode_SEN0524(tof_frame_buf, &d, &meas_valid) == 0)
                 {
-                    distance_sensor_packet_ready = 1;
+                    // Structurally-valid frame: the sensor is alive and streaming.
+                    tof_frame_seen = 1;
                     last_valid_packet_tick = HAL_GetTick();
+
+                    // meas_valid is always 1 now (the per-generation dis_status
+                    // flag is ignored in decode_SEN0524); the guard is kept so
+                    // sample collection stays decoupled from liveness detection.
+                    if (meas_valid)
+                    {
+                        distance_mm = d;
+                        distance_sensor_packet_ready = 1;
+                    }
                 }
                 // Reset for the next frame
                 tof_rx_state = TOF_STATE_WAIT_HEADER;
@@ -941,12 +1010,30 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-	  // Accumulate TOF frames into the current distance sensor's buffer.
+	  // Stream liveness: any structurally-valid frame (valid OR invalid
+	  // measurement) means the sensor is connected and talking. Keyed off
+	  // tof_frame_seen so an all-invalid stream doesn't false-trip the fault.
+	  if (tof_frame_seen)
+	  {
+		  tof_frame_seen = 0;
+		  set_error_LED(0);
+		  last_frame_ms = HAL_GetTick();
+	  }
+	  else if (HAL_GetTick() - last_frame_ms > NO_FRAME_TIMEOUT_MS)
+	  {
+		  // No frames at all for a while: sensor likely disconnected. Flag the
+		  // fault and let the reprobe / resync logic recover. Time-based, not
+		  // iteration-based, since the main loop spins far faster than frames
+		  // arrive (~10 Hz).
+		  my_printf("Error: no frame from distance sensor.\n\r");
+		  set_error_LED(1);
+	  }
+
+	  // Accumulate usable samples into the current distance sensor's buffer.
+	  // Only frames with a valid measurement reach here (set in the RX callback).
 	  if (distance_sensor_packet_ready)
 	  {
-		  set_error_LED(0);
 		  distance_sensor_packet_ready = 0;
-		  last_frame_ms = HAL_GetTick();
 
 		  // cur_dist_slot tracks which active sensor port the MUX is on.
 		  // sensors_data_sending_to_LoRA_concentrator() advances it (and the
@@ -962,14 +1049,6 @@ int main(void)
 			  print_out_cnt = 0;
 		  }
 	  }
-	  else if (HAL_GetTick() - last_frame_ms > NO_FRAME_TIMEOUT_MS)
-	  {
-		  // No valid frame for a while: flag the fault and let the reprobe /
-		  // resync logic below recover. Time-based, not iteration-based, since
-		  // the main loop spins far faster than frames arrive (~10 Hz).
-		  my_printf("Error: no frame from distance sensor.\n\r");
-		  set_error_LED(1);
-	  }
 
 	  HAL_IWDG_Refresh(&hiwdg);
 
@@ -980,7 +1059,10 @@ int main(void)
 		  tof_frame_idx = 0;
 	  }
 
-	  if (HAL_GetTick() - last_valid_packet_tick > 800) {
+	  // Resync only when a partial frame has been sitting half-received for a
+	  // while (a real stall). Don't blanket-reset the idle WAIT_HEADER state:
+	  // at low frame rates that risked clobbering a frame that had just begun.
+	  if (tof_frame_idx > 0 && HAL_GetTick() - last_valid_packet_tick > 800) {
 		  tof_rx_state = TOF_STATE_WAIT_HEADER;
 		  tof_frame_idx = 0;
 		  last_valid_packet_tick = HAL_GetTick();
