@@ -343,12 +343,12 @@ void probe_sensors(void)
 
     my_printf("Probe complete: %d sensor(s) found.\n\r", num_sensors_present);
 
-    // If nothing found, fall back to port 1 so the system still runs
+    // No fallback: if no distance sensors are detected, leave
+    // num_sensors_present == 0. The TX rotation (num_slots = 2 + N) then sends
+    // only temperature + humidity, so no bogus 0 mm distance is transmitted.
+    // A sensor connected later is picked up by the periodic reprobe (GAINED).
     if (num_sensors_present == 0) {
-        my_printf("WARNING: no sensors detected - defaulting to port 1\n\r");
-        sensor_present[0]      = 1;
-        active_sensor_idx[0]   = 0;
-        num_sensors_present    = 1;
+        my_printf("WARNING: no distance sensors detected - distance TX disabled\n\r");
     }
 }
 
@@ -1035,18 +1035,24 @@ int main(void)
 	  {
 		  distance_sensor_packet_ready = 0;
 
-		  // cur_dist_slot tracks which active sensor port the MUX is on.
-		  // sensors_data_sending_to_LoRA_concentrator() advances it (and the
-		  // MUX) each time a distance slot is transmitted, so here we just
-		  // need to know which sensor is currently collecting.
-		  uint8_t cur_idx = active_sensor_idx[cur_dist_slot];
-		  DistanceBuffer_Add(cur_idx, distance_mm);
-
-		  if ((print_out_cnt++) > 10)
+		  // Guard against having no detected distance sensors: with an empty
+		  // active list there is no slot to accumulate into (and the reprobe
+		  // will fold in any sensor that starts talking).
+		  if (num_sensors_present > 0)
 		  {
-			  my_printf("distance:%u [mm] port %d (n=%u)\n\r",
-			            distance_mm, cur_idx + 1, DistanceBuffer_GetCount(cur_idx));
-			  print_out_cnt = 0;
+			  // cur_dist_slot tracks which active sensor port the MUX is on.
+			  // sensors_data_sending_to_LoRA_concentrator() advances it (and the
+			  // MUX) each time a distance slot is transmitted, so here we just
+			  // need to know which sensor is currently collecting.
+			  uint8_t cur_idx = active_sensor_idx[cur_dist_slot];
+			  DistanceBuffer_Add(cur_idx, distance_mm);
+
+			  if ((print_out_cnt++) > 10)
+			  {
+				  my_printf("distance:%u [mm] port %d (n=%u)\n\r",
+				            distance_mm, cur_idx + 1, DistanceBuffer_GetCount(cur_idx));
+				  print_out_cnt = 0;
+			  }
 		  }
 	  }
 
