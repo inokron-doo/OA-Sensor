@@ -392,8 +392,9 @@ void select_distance_sensor(uint8_t sensor_nr_to_select)
  * currently reading invalid (fog, empty trough, dead-zone) is not mistaken for
  * absent.  A known sensor is only dropped after DROP_AFTER_MISSES consecutive
  * failed reprobes (hysteresis), so a single unlucky probe window can't prune it.
- * Never falls back to port 1 on total failure (keeps the old list).  Resets the
- * TX rotation and sample buffers afterwards.
+ * If every sensor has been dropped the active list becomes empty and distance TX
+ * stops, same as a boot with no sensors, until a sensor is GAINED again.  Never
+ * falls back to port 1.  Resets the TX rotation and sample buffers afterwards.
  */
 void reprobe_sensors(void)
 {
@@ -452,13 +453,14 @@ void reprobe_sensors(void)
             new_active[new_count++] = i;
     }
 
-    if (new_count > 0) {
-        for (uint8_t i = 0; i < 4; i++) sensor_present[i]    = new_present[i];
-        for (uint8_t i = 0; i < 4; i++) active_sensor_idx[i] = new_active[i];
-        num_sensors_present = new_count;
-    } else {
-        my_printf("  No sensors found -- keeping old list\n\r");
-    }
+    // Apply the new list even when it is empty. Thanks to the hysteresis above,
+    // an empty list means every known sensor missed DROP_AFTER_MISSES reprobes in
+    // a row, so it is really gone; keeping the old list would keep sending 0 mm.
+    for (uint8_t i = 0; i < 4; i++) sensor_present[i]    = new_present[i];
+    for (uint8_t i = 0; i < 4; i++) active_sensor_idx[i] = new_active[i];
+    num_sensors_present = new_count;
+    if (num_sensors_present == 0)
+        my_printf("  No distance sensors - distance TX disabled\n\r");
 
     // Clear all buffers, reset TX rotation, point MUX at first active sensor
     for (uint8_t i = 0; i < 4; i++) DistanceBuffer_Clear(i);
@@ -942,6 +944,7 @@ int main(void)
 	uint32_t last_tx_100ms      = 0xFFFFFFFF;
 	uint32_t last_reprobe_100ms = 0;
 	uint32_t last_frame_ms      = 0;  // tick of the last frame consumed by the main loop
+	uint8_t  no_frame_fault     = 0;  // 1 while the no-frame fault is reported (log once)
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -1016,17 +1019,24 @@ int main(void)
 	  if (tof_frame_seen)
 	  {
 		  tof_frame_seen = 0;
+		  if (no_frame_fault)
+		  {
+			  my_printf("Distance sensor frames resumed.\n\r");
+			  no_frame_fault = 0;
+		  }
 		  set_error_LED(0);
 		  last_frame_ms = HAL_GetTick();
 	  }
-	  else if (HAL_GetTick() - last_frame_ms > NO_FRAME_TIMEOUT_MS)
+	  else if (!no_frame_fault && HAL_GetTick() - last_frame_ms > NO_FRAME_TIMEOUT_MS)
 	  {
 		  // No frames at all for a while: sensor likely disconnected. Flag the
 		  // fault and let the reprobe / resync logic recover. Time-based, not
 		  // iteration-based, since the main loop spins far faster than frames
-		  // arrive (~10 Hz).
+		  // arrive (~10 Hz). Logged once per outage; the LED stays on until a
+		  // frame arrives again.
 		  my_printf("Error: no frame from distance sensor.\n\r");
 		  set_error_LED(1);
+		  no_frame_fault = 1;
 	  }
 
 	  // Accumulate usable samples into the current distance sensor's buffer.
@@ -1094,6 +1104,10 @@ int main(void)
 	      reprobe_sensors();
 	      last_reprobe_100ms = global_100ms_counter;
 	      reprobe_requested  = 0;
+	      // The reprobe blocks for several seconds and swallows the frames it
+	      // sees, so restart the no-frame timer (as after the boot probe) to
+	      // avoid a false "no frame" right after every reprobe.
+	      last_frame_ms = HAL_GetTick();
 	  }
   }
   /* USER CODE END 3 */
